@@ -1,7 +1,9 @@
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, status
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.dependencies.auth import get_current_user
+from app.models.user import User
 from app.schemas.upload import (
     UploadInitRequest,
     UploadInitResponse,
@@ -10,6 +12,7 @@ from app.schemas.upload import (
     UploadCompleteResponse,
     UploadAbortResponse,
     DeleteVideoResponse,
+    CleanupResponse,
 )
 from app.services.upload_service import UploadService
 
@@ -25,13 +28,14 @@ upload_service = UploadService()
 )
 def initiate_upload(
     req: UploadInitRequest,
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> UploadInitResponse:
     """
-    Creates an upload session in PostgreSQL and starts a multipart upload in S3.
-    Returns session metadata including total parts and expected part sizes.
+    Validates user quota, creates an upload session in PostgreSQL,
+    and initiates an S3 multipart upload.
     """
-    return upload_service.initiate_upload(db=db, req=req)
+    return upload_service.initiate_upload(db=db, req=req, user=current_user)
 
 
 @router.get(
@@ -41,7 +45,7 @@ def initiate_upload(
 )
 def get_resume_status(
     upload_id: str,
-    user_id: str = Query(..., description="User ID for authorization"),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> ResumeStatusResponse:
     """
@@ -51,7 +55,7 @@ def get_resume_status(
     return upload_service.get_resume_status(
         db=db,
         upload_id=upload_id,
-        user_id=user_id,
+        user_id=current_user.user_id,
     )
 
 
@@ -63,7 +67,7 @@ def get_resume_status(
 def get_presigned_part_url(
     upload_id: str,
     part_number: int,
-    user_id: str = Query(..., description="User ID for authorization"),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> PartPresignResponse:
     """
@@ -74,7 +78,7 @@ def get_presigned_part_url(
         db=db,
         upload_id=upload_id,
         part_number=part_number,
-        user_id=user_id,
+        user_id=current_user.user_id,
     )
 
 
@@ -85,17 +89,17 @@ def get_presigned_part_url(
 )
 def complete_upload(
     upload_id: str,
-    user_id: str = Query(..., description="User ID for authorization"),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> UploadCompleteResponse:
     """
     Verifies that all parts are safely stored in S3 and triggers S3 assembly.
-    Idempotent: safe to call multiple times.
+    Idempotent and concurrency-safe with pessimistic row locking.
     """
     return upload_service.complete_upload(
         db=db,
         upload_id=upload_id,
-        user_id=user_id,
+        user_id=current_user.user_id,
     )
 
 
@@ -106,7 +110,7 @@ def complete_upload(
 )
 def abort_upload(
     upload_id: str,
-    user_id: str = Query(..., description="User ID for authorization"),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> UploadAbortResponse:
     """
@@ -115,7 +119,7 @@ def abort_upload(
     return upload_service.abort_upload(
         db=db,
         upload_id=upload_id,
-        user_id=user_id,
+        user_id=current_user.user_id,
     )
 
 
@@ -126,14 +130,14 @@ def abort_upload(
 )
 def delete_video(
     video_id: str,
-    user_id: str = Query(..., description="User ID for authorization"),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> DeleteVideoResponse:
-    """Deletes a completed video object from S3 and removes its database record."""
+    """Deletes a completed video object from S3 and reclaims storage quota."""
     return upload_service.delete_video(
         db=db,
         video_id=video_id,
-        user_id=user_id,
+        user_id=current_user.user_id,
     )
 
 
@@ -144,13 +148,29 @@ def delete_video(
 )
 def delete_completed_upload(
     upload_id: str,
-    user_id: str = Query(..., description="User ID for authorization"),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> DeleteVideoResponse:
-    """Deletes the final video for a completed upload session."""
+    """Deletes the final video for a completed upload session and reclaims storage quota."""
     return upload_service.delete_completed_upload(
         db=db,
         upload_id=upload_id,
-        user_id=user_id,
+        user_id=current_user.user_id,
     )
+
+
+@router.post(
+    "/cleanup-expired",
+    response_model=CleanupResponse,
+    summary="Maintenance task: abort stale S3 multipart uploads and mark sessions EXPIRED",
+)
+def cleanup_expired_sessions(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> CleanupResponse:
+    """
+    Sweeps for active sessions exceeding their expiration timestamp,
+    aborts their S3 multipart uploads to prevent storage leak, and sets status to EXPIRED.
+    """
+    return upload_service.cleanup_expired_sessions(db=db)
 

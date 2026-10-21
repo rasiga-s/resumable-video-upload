@@ -6,6 +6,8 @@ from app.schemas.upload import (
     ResumeStatusResponse,
     UploadCompleteResponse,
     UploadAbortResponse,
+    DeleteVideoResponse,
+    CleanupResponse,
 )
 
 __all__ = [
@@ -16,5 +18,7 @@ __all__ = [
     "ResumeStatusResponse",
     "UploadCompleteResponse",
     "UploadAbortResponse",
+    "DeleteVideoResponse",
+    "CleanupResponse",
 ]
 

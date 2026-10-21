@@ -4,7 +4,8 @@ from typing import AsyncGenerator
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.database import Base, engine
+from app.database import Base, engine, SessionLocal
+from app.dependencies.auth import seed_default_user_if_needed
 from app.routers import uploads_router
 from app.services.s3_service import S3Service
 
@@ -26,6 +27,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("Initializing database tables...")
     Base.metadata.create_all(bind=engine)
     logger.info("Database tables initialized successfully.")
+
+    # Seed default creator user if not present
+    with SessionLocal() as db:
+        seed_default_user_if_needed(db)
 
     logger.info("Ensuring S3 bucket and CORS rules exist...")
     s3_service = S3Service()

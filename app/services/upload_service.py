@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.models.session import UploadSession, UploadStatus
 from app.models.video import Video, VideoStatus
+from app.models.user import User
 from app.schemas.upload import (
     UploadInitRequest,
     UploadInitResponse,
@@ -19,6 +20,7 @@ from app.schemas.upload import (
     UploadCompleteResponse,
     UploadAbortResponse,
     DeleteVideoResponse,
+    CleanupResponse,
 )
 from app.services.s3_service import S3Service
 
@@ -32,11 +34,22 @@ class UploadService:
     def __init__(self, s3_service: S3Service | None = None) -> None:
         self.s3_service = s3_service or S3Service()
 
-    def initiate_upload(self, db: Session, req: UploadInitRequest) -> UploadInitResponse:
+    def initiate_upload(self, db: Session, req: UploadInitRequest, user: User) -> UploadInitResponse:
         """
-        Validates file size, determines part size and total parts,
+        Validates user quota, determines part size and total parts,
         initiates S3 multipart upload, and persists the UploadSession in PostgreSQL.
         """
+        # Quota Validation: Ensure the user's storage quota is not exceeded
+        if user.used_storage_bytes + req.file_size > user.storage_quota_bytes:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"Storage quota exceeded. Currently using {user.used_storage_bytes // (1024 * 1024)} MB of "
+                    f"{user.storage_quota_bytes // (1024 * 1024)} MB. "
+                    f"Cannot upload {req.file_size // (1024 * 1024)} MB."
+                ),
+            )
+
         # Determine part size (minimum 5 MB per AWS S3 constraints)
         part_size = req.part_size or settings.default_part_size_bytes
         if part_size < settings.min_part_size_bytes:
@@ -51,7 +64,7 @@ class UploadService:
 
         upload_id = str(uuid.uuid4())
         # Destination key in S3: videos/{user_id}/{upload_id}/{filename}
-        object_key = f"videos/{req.user_id}/{upload_id}/{req.filename}"
+        object_key = f"videos/{user.user_id}/{upload_id}/{req.filename}"
 
         # Step 1: Initiate S3 Multipart Upload
         s3_upload_id = self.s3_service.create_multipart_upload(object_key)
@@ -62,7 +75,7 @@ class UploadService:
         # Step 2: Persist upload session record in database
         session = UploadSession(
             upload_id=upload_id,
-            user_id=req.user_id,
+            user_id=user.user_id,
             filename=req.filename,
             file_size=req.file_size,
             part_size=part_size,
@@ -326,7 +339,7 @@ class UploadService:
     def _scan_and_promote_video(self, db: Session, video_id: str) -> None:
         """
         Simulates container header validation, codec inspection, and malware scanning
-        before promoting a video from PROCESSING to READY.
+        before promoting a video from PROCESSING to READY. Updates user storage usage.
         """
         video = db.query(Video).filter(Video.video_id == video_id).first()
         if not video:
@@ -334,6 +347,12 @@ class UploadService:
         # In a full production distributed system, this is handled by an async worker (SQS/Kafka).
         # We simulate the clean scanning verification here:
         video.status = VideoStatus.READY
+
+        # Update user's used storage quota
+        user = db.query(User).filter(User.user_id == video.user_id).first()
+        if user:
+            user.used_storage_bytes += video.file_size
+
         db.commit()
 
     def delete_video(
@@ -342,7 +361,7 @@ class UploadService:
         video_id: str,
         user_id: str,
     ) -> DeleteVideoResponse:
-        """Removes a completed video and its final object from storage."""
+        """Removes a completed video and its final object from storage, reclaiming quota."""
         video = db.query(Video).filter(Video.video_id == video_id).first()
         if not video:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Video not found")
@@ -362,6 +381,11 @@ class UploadService:
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"Could not delete the video from S3: {exc}",
             ) from exc
+
+        # Reclaim user storage quota
+        user = db.query(User).filter(User.user_id == video.user_id).first()
+        if user:
+            user.used_storage_bytes = max(0, user.used_storage_bytes - video.file_size)
 
         db.delete(video)
         db.commit()
@@ -426,5 +450,41 @@ class UploadService:
             upload_id=session.upload_id,
             status=session.status.value,
             message="Upload session aborted and S3 storage freed.",
+        )
+
+    def cleanup_expired_sessions(self, db: Session) -> CleanupResponse:
+        """
+        Sweeps for active upload sessions that exceeded expires_at.
+        Aborts the S3 multipart upload to free chunk storage and marks status EXPIRED.
+        """
+        now = datetime.now(timezone.utc)
+        expired_sessions = (
+            db.query(UploadSession)
+            .filter(
+                UploadSession.status.in_([UploadStatus.INITIATED, UploadStatus.UPLOADING]),
+                UploadSession.expires_at < now,
+            )
+            .all()
+        )
+
+        cleaned_count = 0
+        for session in expired_sessions:
+            try:
+                self.s3_service.abort_multipart_upload(
+                    object_key=session.object_key,
+                    s3_upload_id=session.s3_upload_id,
+                )
+            except Exception as e:
+                logger.warning("Failed to abort S3 upload for expired session %s: %s", session.upload_id, e)
+
+            session.status = UploadStatus.EXPIRED
+            session.updated_at = now
+            cleaned_count += 1
+
+        db.commit()
+        logger.info("Cleaned up %d expired upload sessions.", cleaned_count)
+        return CleanupResponse(
+            cleaned_sessions_count=cleaned_count,
+            message=f"Successfully cleaned up and aborted {cleaned_count} expired upload session(s).",
         )
 

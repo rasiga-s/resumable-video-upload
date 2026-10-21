@@ -5,13 +5,17 @@ from pydantic import BaseModel, Field
 
 class UploadInitRequest(BaseModel):
     filename: str = Field(..., min_length=1, max_length=255, description="Name of the video file")
-    file_size: int = Field(..., gt=0, description="Total file size in bytes")
+    file_size: int = Field(
+        ...,
+        gt=0,
+        le=50 * 1024 * 1024 * 1024,
+        description="Total file size in bytes (maximum 50 GB per file)",
+    )
     part_size: Optional[int] = Field(
         None,
         ge=5 * 1024 * 1024,
         description="Optional custom part size in bytes (minimum 5 MB per AWS S3 rule)",
     )
-    user_id: str = Field(..., min_length=1, description="ID of the uploading user")
 
 
 class UploadInitResponse(BaseModel):
@@ -71,4 +75,10 @@ class DeleteVideoResponse(BaseModel):
     status: str
     message: str
     deleted_from_storage: bool = True
+
+
+class CleanupResponse(BaseModel):
+    cleaned_sessions_count: int
+    message: str
+
 

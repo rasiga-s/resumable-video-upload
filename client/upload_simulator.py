@@ -2,13 +2,14 @@
 """
 Resumable Video Upload Client Simulator.
 
-Demonstrates the YouTube-style upload lifecycle:
-1. Initiates an upload session.
-2. Uploads initial parts directly to S3 via presigned URLs.
-3. Simulates a Wi-Fi disconnect / network failure.
-4. Reconnects and queries the backend for authoritative resume status.
-5. Uploads only the missing parts.
-6. Assembles the final video and tests idempotent completion.
+Demonstrates the YouTube-style upload lifecycle with production safeguards:
+1. Authenticates securely via Bearer token (no user spoofing).
+2. Initiates an upload session (quota and single-file size checked).
+3. Uploads initial parts directly to S3 via presigned URLs with exponential backoff retries.
+4. Simulates an abrupt Wi-Fi disconnect / network failure.
+5. Reconnects and queries the backend for authoritative resume status.
+6. Uploads only the missing parts.
+7. Assembles the final video, triggers quarantine scanning, and tests idempotent completion.
 """
 
 import os
@@ -17,7 +18,9 @@ import time
 import requests
 
 API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
-USER_ID = "creator_123"
+API_KEY = os.getenv("API_KEY", "test-api-key-123")
+AUTH_HEADERS = {"Authorization": f"Bearer {API_KEY}"}
+
 TEST_FILENAME = "test_large_video.mp4"
 # 25 MB test file: 5 parts of 5 MB each (5 MB is AWS S3's minimum part size)
 PART_SIZE = 5 * 1024 * 1024  # 5 MB
@@ -44,13 +47,17 @@ def upload_part_to_s3(
     upload_id: str,
     part_number: int,
     part_size: int,
-    user_id: str,
+    headers: dict,
+    max_retries: int = 3,
 ) -> None:
-    """Fetches a presigned URL and uploads the raw byte chunk directly to S3."""
-    # 1. Ask FastAPI for a presigned S3 PUT URL (POST to mutate session state to UPLOADING)
+    """
+    Fetches a presigned URL using authenticated session and streams raw bytes
+    directly to S3 with exponential backoff retries.
+    """
+    # 1. Ask FastAPI for a presigned S3 PUT URL (POST request with Bearer Auth)
     url_resp = requests.post(
         f"{API_BASE_URL}/uploads/{upload_id}/parts/{part_number}/url",
-        params={"user_id": user_id},
+        headers=headers,
     )
     url_resp.raise_for_status()
     presigned_url = url_resp.json()["presigned_url"]
@@ -61,10 +68,20 @@ def upload_part_to_s3(
         f.seek(offset)
         part_bytes = f.read(part_size)
 
-    # 3. Stream bytes directly to S3 / LocalStack
-    put_resp = requests.put(presigned_url, data=part_bytes)
-    put_resp.raise_for_status()
-    print(f"   ⬆️  Part {part_number} successfully uploaded to S3 ({len(part_bytes) // (1024 * 1024)} MB)")
+    # 3. Stream bytes directly to S3 / LocalStack with exponential backoff
+    for attempt in range(1, max_retries + 1):
+        try:
+            put_resp = requests.put(presigned_url, data=part_bytes, timeout=30)
+            put_resp.raise_for_status()
+            print(f"   ⬆️  Part {part_number} successfully uploaded to S3 ({len(part_bytes) // (1024 * 1024)} MB)")
+            return
+        except Exception as exc:
+            if attempt == max_retries:
+                print(f"   ❌ Part {part_number} failed after {max_retries} attempts: {exc}")
+                raise
+            sleep_sec = 2 ** (attempt - 1)
+            print(f"   ⚠️ Part {part_number} attempt {attempt} failed ({exc}). Retrying in {sleep_sec}s...")
+            time.sleep(sleep_sec)
 
 
 def main() -> None:
@@ -88,29 +105,28 @@ def main() -> None:
     # Step 1: Create local dummy video file
     create_dummy_video_file(TEST_FILENAME, FILE_SIZE)
 
-    # Step 2: Initiate upload session
-    print("\n[Step 1] Initiating upload session with FastAPI...")
+    # Step 2: Initiate upload session with Bearer Auth
+    print("\n[Step 1] Initiating upload session with FastAPI (Authenticated via Bearer Token)...")
     init_payload = {
         "filename": TEST_FILENAME,
         "file_size": FILE_SIZE,
         "part_size": PART_SIZE,
-        "user_id": USER_ID,
     }
-    init_resp = requests.post(f"{API_BASE_URL}/uploads", json=init_payload)
+    init_resp = requests.post(f"{API_BASE_URL}/uploads", json=init_payload, headers=AUTH_HEADERS)
     init_resp.raise_for_status()
     init_data = init_resp.json()
 
     upload_id = init_data["upload_id"]
     total_parts = init_data["total_parts"]
     print(f"✅ Session created:")
-    print(f"   - Upload ID:   {upload_id}")
+    print(f"   - Upload ID:    {upload_id}")
     print(f"   - S3 Upload ID: {init_data['s3_upload_id']}")
-    print(f"   - Total Parts: {total_parts} (Part size: {init_data['part_size'] // (1024 * 1024)} MB)")
+    print(f"   - Total Parts:  {total_parts} (Part size: {init_data['part_size'] // (1024 * 1024)} MB)")
 
     # Step 3: Upload initial parts (Parts 1 & 2)
-    print("\n[Step 2] Uploading initial chunks (Parts 1 & 2)...")
+    print("\n[Step 2] Uploading initial chunks directly to S3 (Parts 1 & 2)...")
     for part_num in [1, 2]:
-        upload_part_to_s3(TEST_FILENAME, upload_id, part_num, PART_SIZE, USER_ID)
+        upload_part_to_s3(TEST_FILENAME, upload_id, part_num, PART_SIZE, headers=AUTH_HEADERS)
 
     # Step 4: Simulate Wi-Fi drop / network disconnection
     print("\n" + "!" * 70)
@@ -126,7 +142,7 @@ def main() -> None:
     print("\n[Step 3] Wi-Fi restored! Querying server for authoritative resume status...")
     resume_resp = requests.get(
         f"{API_BASE_URL}/uploads/{upload_id}/resume",
-        params={"user_id": USER_ID},
+        headers=AUTH_HEADERS,
     )
     resume_resp.raise_for_status()
     resume_data = resume_resp.json()
@@ -140,13 +156,13 @@ def main() -> None:
     missing_parts = resume_data["missing_part_numbers"]
     print(f"\n[Step 4] Resuming upload from missing parts: {missing_parts}...")
     for part_num in missing_parts:
-        upload_part_to_s3(TEST_FILENAME, upload_id, part_num, PART_SIZE, USER_ID)
+        upload_part_to_s3(TEST_FILENAME, upload_id, part_num, PART_SIZE, headers=AUTH_HEADERS)
 
     # Step 7: Complete the upload
     print("\n[Step 5] All parts uploaded. Requesting final assembly in S3...")
     complete_resp = requests.post(
         f"{API_BASE_URL}/uploads/{upload_id}/complete",
-        params={"user_id": USER_ID},
+        headers=AUTH_HEADERS,
     )
     complete_resp.raise_for_status()
     complete_data = complete_resp.json()
@@ -161,7 +177,7 @@ def main() -> None:
     print("\n[Step 6] Testing Idempotency (calling /complete a second time)...")
     retry_resp = requests.post(
         f"{API_BASE_URL}/uploads/{upload_id}/complete",
-        params={"user_id": USER_ID},
+        headers=AUTH_HEADERS,
     )
     retry_resp.raise_for_status()
     retry_data = retry_resp.json()
@@ -179,4 +195,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
