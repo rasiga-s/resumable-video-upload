@@ -55,7 +55,7 @@ def get_resume_status(
     )
 
 
-@router.get(
+@router.post(
     "/{upload_id}/parts/{part_number}/url",
     response_model=PartPresignResponse,
     summary="Generate presigned S3 PUT URL for a specific part",

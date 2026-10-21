@@ -68,6 +68,28 @@ class S3Service:
         )
         logger.info("Configured CORS on bucket '%s' with exposed ETag.", self.bucket_name)
 
+        # Configure lifecycle rule to automatically abort incomplete multipart uploads
+        try:
+            lifecycle_configuration = {
+                "Rules": [
+                    {
+                        "ID": "AbortIncompleteMultipartUploadsAfter1Day",
+                        "Status": "Enabled",
+                        "Filter": {"Prefix": ""},
+                        "AbortIncompleteMultipartUpload": {
+                            "DaysAfterInitiation": 1
+                        },
+                    }
+                ]
+            }
+            self.s3_client.put_bucket_lifecycle_configuration(
+                Bucket=self.bucket_name,
+                LifecycleConfiguration=lifecycle_configuration,
+            )
+            logger.info("Configured lifecycle rule on bucket '%s' to abort stale uploads after 1 day.", self.bucket_name)
+        except Exception as e:
+            logger.warning("Could not set lifecycle configuration on S3 bucket: %s", e)
+
     def create_multipart_upload(self, object_key: str, content_type: str = "video/mp4") -> str:
         """Initiate an S3 multipart upload session and return the AWS s3_upload_id."""
         response = self.s3_client.create_multipart_upload(
@@ -174,4 +196,17 @@ class S3Service:
             Bucket=self.bucket_name,
             Key=object_key,
         )
+
+    def get_object_metadata(self, object_key: str) -> Dict[str, Any] | None:
+        """Fetch metadata for an object in S3, or None if it does not exist."""
+        try:
+            return self.s3_client.head_object(
+                Bucket=self.bucket_name,
+                Key=object_key,
+            )
+        except ClientError as e:
+            error_code = e.response.get("Error", {}).get("Code", "")
+            if error_code in ("404", "NoSuchKey", "NotFound"):
+                return None
+            raise
 

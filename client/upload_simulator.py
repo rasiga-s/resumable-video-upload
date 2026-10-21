@@ -47,8 +47,8 @@ def upload_part_to_s3(
     user_id: str,
 ) -> None:
     """Fetches a presigned URL and uploads the raw byte chunk directly to S3."""
-    # 1. Ask FastAPI for a presigned S3 PUT URL
-    url_resp = requests.get(
+    # 1. Ask FastAPI for a presigned S3 PUT URL (POST to mutate session state to UPLOADING)
+    url_resp = requests.post(
         f"{API_BASE_URL}/uploads/{upload_id}/parts/{part_number}/url",
         params={"user_id": user_id},
     )
