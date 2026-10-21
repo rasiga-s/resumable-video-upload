@@ -168,3 +168,10 @@ class S3Service:
             UploadId=s3_upload_id,
         )
 
+    def delete_object(self, object_key: str) -> None:
+        """Delete a completed video object from the S3 bucket."""
+        self.s3_client.delete_object(
+            Bucket=self.bucket_name,
+            Key=object_key,
+        )
+

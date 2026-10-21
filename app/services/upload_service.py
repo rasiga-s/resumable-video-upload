@@ -16,6 +16,7 @@ from app.schemas.upload import (
     ResumeStatusResponse,
     UploadCompleteResponse,
     UploadAbortResponse,
+    DeleteVideoResponse,
 )
 from app.services.s3_service import S3Service
 
@@ -273,6 +274,64 @@ class UploadService:
             message="Upload successfully completed and video assembled in S3.",
         )
 
+    def delete_video(
+        self,
+        db: Session,
+        video_id: str,
+        user_id: str,
+    ) -> DeleteVideoResponse:
+        """Removes a completed video and its final object from storage."""
+        video = db.query(Video).filter(Video.video_id == video_id).first()
+        if not video:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Video not found")
+
+        if video.user_id != user_id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied: unauthorized user")
+
+        session = db.query(UploadSession).filter(UploadSession.upload_id == video.upload_session_id).first()
+        if session:
+            session.status = UploadStatus.ABORTED
+            session.updated_at = datetime.now(timezone.utc)
+
+        try:
+            self.s3_service.delete_object(video.object_key)
+        except Exception as exc:  # pragma: no cover - surfaced as API error for callers
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Could not delete the video from S3: {exc}",
+            ) from exc
+
+        db.delete(video)
+        db.commit()
+
+        return DeleteVideoResponse(
+            video_id=video.video_id,
+            upload_id=video.upload_session_id,
+            status="DELETED",
+            message="Video deleted successfully from storage and metadata.",
+            deleted_from_storage=True,
+        )
+
+    def delete_completed_upload(
+        self,
+        db: Session,
+        upload_id: str,
+        user_id: str,
+    ) -> DeleteVideoResponse:
+        """Delete a completed uploaded video by upload session id."""
+        session = db.query(UploadSession).filter(UploadSession.upload_id == upload_id).first()
+        if not session:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Upload session not found")
+
+        if session.user_id != user_id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied: unauthorized user")
+
+        video = db.query(Video).filter(Video.upload_session_id == upload_id).first()
+        if not video:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No completed video exists for this upload session")
+
+        return self.delete_video(db=db, video_id=video.video_id, user_id=user_id)
+
     def abort_upload(
         self,
         db: Session,
@@ -290,7 +349,7 @@ class UploadService:
         if session.status == UploadStatus.COMPLETED:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Cannot abort a completed upload.",
+                detail="Completed uploads must be deleted via the video deletion endpoint.",
             )
 
         if session.status != UploadStatus.ABORTED:

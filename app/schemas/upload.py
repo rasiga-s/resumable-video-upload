@@ -64,3 +64,11 @@ class UploadAbortResponse(BaseModel):
     status: str
     message: str
 
+
+class DeleteVideoResponse(BaseModel):
+    video_id: str
+    upload_id: str
+    status: str
+    message: str
+    deleted_from_storage: bool = True
+

@@ -9,6 +9,7 @@ from app.schemas.upload import (
     ResumeStatusResponse,
     UploadCompleteResponse,
     UploadAbortResponse,
+    DeleteVideoResponse,
 )
 from app.services.upload_service import UploadService
 
@@ -112,6 +113,42 @@ def abort_upload(
     Aborts the S3 multipart upload and cleans up stored part bytes.
     """
     return upload_service.abort_upload(
+        db=db,
+        upload_id=upload_id,
+        user_id=user_id,
+    )
+
+
+@router.delete(
+    "/videos/{video_id}",
+    response_model=DeleteVideoResponse,
+    summary="Delete a completed uploaded video from storage and metadata",
+)
+def delete_video(
+    video_id: str,
+    user_id: str = Query(..., description="User ID for authorization"),
+    db: Session = Depends(get_db),
+) -> DeleteVideoResponse:
+    """Deletes a completed video object from S3 and removes its database record."""
+    return upload_service.delete_video(
+        db=db,
+        video_id=video_id,
+        user_id=user_id,
+    )
+
+
+@router.delete(
+    "/{upload_id}/video",
+    response_model=DeleteVideoResponse,
+    summary="Delete a completed upload by session id",
+)
+def delete_completed_upload(
+    upload_id: str,
+    user_id: str = Query(..., description="User ID for authorization"),
+    db: Session = Depends(get_db),
+) -> DeleteVideoResponse:
+    """Deletes the final video for a completed upload session."""
+    return upload_service.delete_completed_upload(
         db=db,
         upload_id=upload_id,
         user_id=user_id,
