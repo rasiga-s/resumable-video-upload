@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000').replace(/\/$/, '')
-const DEFAULT_USER_ID = 'creator_123'
+const API_KEY = import.meta.env.VITE_API_KEY || 'test-api-key-123'
+const DEFAULT_USER_ID = 'test_creator_123'
 const STORAGE_KEY = 'frameflow.uploads.v1'
+const VIDEO_PREVIEW_FRAME_COUNT = 24
 
 type UploadPhase = 'idle' | 'ready' | 'uploading' | 'paused' | 'completed' | 'error'
 type PartPhase = 'waiting' | 'uploading' | 'uploaded'
@@ -83,7 +85,9 @@ async function readApiError(response: Response): Promise<string> {
 async function apiRequest<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response
   try {
-    response = await fetch(`${API_BASE_URL}${path}`, init)
+    const headers = new Headers(init?.headers)
+    headers.set('Authorization', `Bearer ${API_KEY}`)
+    response = await fetch(`${API_BASE_URL}${path}`, { ...init, headers })
   } catch (error) {
     if (error instanceof TypeError) {
       throw new Error(`Can't reach the API at ${API_BASE_URL}. Check that Docker Compose is running.`)
@@ -167,6 +171,8 @@ function Icon({ name, size = 20 }: { name: string; size?: number }) {
   switch (name) {
     case 'film':
       return <svg {...shared}><rect x="3" y="4" width="18" height="16" rx="3" /><path d="m10 9 5 3-5 3V9Z" /><path d="M7 4v3m5-3v3m5-3v3M7 17v3m5-3v3m5-3v3" /></svg>
+    case 'laptop':
+      return <svg {...shared}><rect x="4" y="5" width="16" height="11" rx="2" /><path d="M2 19h20l-1.5-3H3.5L2 19Z" /></svg>
     case 'cloud':
       return <svg {...shared}><path d="M7 18a4 4 0 1 1 .8-7.92A5.5 5.5 0 0 1 18.5 12a3 3 0 0 1-.5 6H7Z" /><path d="M12 16v-5m-2 2 2-2 2 2" /></svg>
     case 'upload':
@@ -203,6 +209,7 @@ function App() {
   const [parts, setParts] = useState<PartView[]>([])
   const [errorMessage, setErrorMessage] = useState('')
   const [completeData, setCompleteData] = useState<CompleteResponse | null>(null)
+  const [videoFrames, setVideoFrames] = useState<string[]>([])
   const [savedUploads, setSavedUploads] = useState<SavedUpload[]>(readSavedUploads)
   const [dragging, setDragging] = useState(false)
   const [isFinalizing, setIsFinalizing] = useState(false)
@@ -221,6 +228,64 @@ function App() {
       .catch(() => { if (active) setApiOnline(false) })
     return () => { active = false }
   }, [])
+
+  useEffect(() => {
+    if (!file) {
+      setVideoFrames([])
+      return
+    }
+
+    let active = true
+    const objectUrl = URL.createObjectURL(file)
+    const video = document.createElement('video')
+    video.preload = 'metadata'
+    video.muted = true
+    video.src = objectUrl
+
+    const extractFrames = async () => {
+      try {
+        await new Promise<void>((resolve, reject) => {
+          video.addEventListener('loadedmetadata', () => resolve(), { once: true })
+          video.addEventListener('error', () => reject(new Error('The selected video preview could not be loaded.')), { once: true })
+        })
+
+        if (!Number.isFinite(video.duration) || video.duration <= 0) {
+          throw new Error('The selected video has no readable duration for previews.')
+        }
+        const canvas = document.createElement('canvas')
+        canvas.width = 160
+        canvas.height = 90
+        const context = canvas.getContext('2d')
+        if (!context) throw new Error('Video preview rendering is unavailable in this browser.')
+
+        for (let index = 0; index < VIDEO_PREVIEW_FRAME_COUNT; index += 1) {
+          const timestamp = video.duration * (index + 1) / (VIDEO_PREVIEW_FRAME_COUNT + 1)
+          await new Promise<void>((resolve, reject) => {
+            video.addEventListener('seeked', () => resolve(), { once: true })
+            video.addEventListener('error', () => reject(new Error('A video preview frame could not be decoded.')), { once: true })
+            video.currentTime = timestamp
+          })
+          if (!active) return
+          context.drawImage(video, 0, 0, canvas.width, canvas.height)
+          const preview = canvas.toDataURL('image/jpeg', 0.72)
+          setVideoFrames((current) => [...current, preview])
+        }
+      } catch (error) {
+        if (active) console.warn('Could not generate video frame previews.', error)
+      }
+    }
+
+    setVideoFrames([])
+    void extractFrames()
+
+    return () => {
+      active = false
+      video.pause()
+      video.removeAttribute('src')
+      video.load()
+      URL.revokeObjectURL(objectUrl)
+    }
+  }, [file])
 
   useEffect(() => {
     writeSavedUploads(savedUploads)
@@ -246,6 +311,12 @@ function App() {
     : 0 : 0
   const activePart = parts.find((part) => part.phase === 'uploading')?.number
   const completedCount = parts.filter((part) => part.phase === 'uploaded').length
+  const visualParts = parts.length > 0
+    ? parts.slice(-40)
+    : Array.from({ length: Math.min(totalParts || 12, 32) }, (_, index) => ({
+      number: index + 1,
+      phase: 'waiting' as PartPhase,
+    }))
 
   const acceptFile = (nextFile?: File) => {
     if (!nextFile) return
@@ -357,7 +428,7 @@ function App() {
         setParts((current) => current.map((part) => part.number === partNumber ? { ...part, phase: 'uploading' } : part))
         const signed = await apiRequest<{ presigned_url: string }>(
           `/uploads/${encodeURIComponent(sessionId)}/parts/${partNumber}/url?user_id=${encodeURIComponent(userId.trim())}`,
-          { signal: controller.signal },
+          { method: 'POST', signal: controller.signal },
         )
         const offset = (partNumber - 1) * resume.part_size
         const chunk = file.slice(offset, Math.min(offset + resume.part_size, file.size))
@@ -524,17 +595,29 @@ function App() {
                   <span className={`phase-badge ${phase}`}>{phase === 'uploading' ? 'IN PROGRESS' : phase === 'completed' ? 'READY' : phase === 'paused' ? 'PAUSED' : phase === 'error' ? 'RETRY' : 'STANDBY'}</span>
                 </div>
                 <div className="progress-caption"><span>OVERALL PROGRESS</span><strong>{progressPercent.toFixed(progressPercent % 1 ? 1 : 0)}%</strong></div>
-                <div className="progress-track"><div className={`progress-fill ${phase === 'completed' ? 'complete' : ''}`} style={{ width: `${progressPercent}%` }} /></div>
-                <div className="progress-meta"><span>{formatBytes(progressBytes)} <i /> {formatBytes(file.size)}</span><span>{phase === 'uploading' ? formatDuration(remainingSeconds) : `${completedCount || 0} / ${totalParts || '—'} parts`} <i /> {partSize ? `${formatBytes(partSize)} / part` : 'multipart'}</span></div>
-                {parts.length > 0 && (
-                  <div className="part-grid" aria-label="Upload parts">
-                    {parts.map((part) => (
-                      <span key={part.number} className={`part-chip ${part.phase}`} title={`Part ${part.number}: ${part.phase}`}>
-                        {part.phase === 'uploaded' ? <Icon name="check" size={12} /> : part.number}
-                      </span>
-                    ))}
+                <div className={`upload-illustration ${phase}`} role="img" aria-label={`Video upload visualization, ${progressPercent.toFixed(0)} percent complete`}>
+                  <div className="upload-route">
+                    <span className="route-device"><Icon name="laptop" size={15} /> THIS DEVICE</span>
+                    <span className="route-line"><span className="route-packet" /></span>
+                    <span className="route-cloud"><Icon name="cloud" size={17} /> CLOUD STORAGE</span>
                   </div>
-                )}
+                  <div className="filmstrip" aria-hidden="true">
+                    <div className="film-frames" style={{ gridTemplateColumns: `repeat(${visualParts.length}, minmax(0, 1fr))` }}>
+                      {visualParts.map((part) => (
+                        <span key={part.number} className={`film-frame ${part.phase}${videoFrames.length > 0 ? ' preview' : ''}`}>
+                          {videoFrames.length > 0 && (
+                            <img
+                              src={videoFrames[Math.floor((part.number - 1) * videoFrames.length / visualParts.length)]}
+                              alt=""
+                              draggable={false}
+                            />
+                          )}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+                <div className="progress-meta"><span>{formatBytes(progressBytes)} <i /> {formatBytes(file.size)}</span><span>{completedCount} / {totalParts || '—'} parts <i /> {phase === 'uploading' ? formatDuration(remainingSeconds) : partSize ? `${formatBytes(partSize)} / part` : 'multipart'}</span></div>
                 {errorMessage && <div className="error-banner" role="alert">{errorMessage}</div>}
                 {completeData && <div className="success-banner"><Icon name="check" size={16} /><span>Video ID <strong>{completeData.video_id}</strong> · {completeData.status}</span></div>}
               </div>

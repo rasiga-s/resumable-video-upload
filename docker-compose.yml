@@ -19,7 +19,7 @@ services:
       retries: 5
 
   localstack:
-    image: localstack/localstack:latest
+    image: localstack/localstack-pro:latest
     container_name: video_upload_localstack
     ports:
       - "4566:4566"
@@ -27,7 +27,9 @@ services:
       - SERVICES=s3
       - AWS_DEFAULT_REGION=us-east-1
       - EXTRA_CORS_ALLOWED_ORIGINS=*
-      - LOCALSTACK_AUTH_TOKEN=${LOCALSTACK_AUTH_TOKEN}
+      - LOCALSTACK_AUTH_TOKEN=${LOCALSTACK_AUTH_TOKEN:?Set LOCALSTACK_AUTH_TOKEN in .env}
+      - PERSISTENCE=1
+      - SNAPSHOT_SAVE_STRATEGY=ON_REQUEST
     volumes:
       - localstack_data:/var/lib/localstack
 

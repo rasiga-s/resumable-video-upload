@@ -160,18 +160,48 @@ class UploadService:
         Fetches the confirmed parts stored in S3, compares against expected parts,
         and returns the missing parts to upload.
         """
-        session = db.query(UploadSession).filter(UploadSession.upload_id == upload_id).first()
+        session = (
+            db.query(UploadSession)
+            .filter(UploadSession.upload_id == upload_id)
+            .with_for_update()
+            .first()
+        )
         if not session:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Upload session not found")
 
         if session.user_id != user_id:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied: unauthorized user")
 
+        if session.status in (UploadStatus.COMPLETED, UploadStatus.ABORTED, UploadStatus.EXPIRED):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Cannot resume an upload in status {session.status.value}",
+            )
+
         # Query S3 directly for confirmed parts
-        s3_parts = self.s3_service.list_all_uploaded_parts(
-            object_key=session.object_key,
-            s3_upload_id=session.s3_upload_id,
-        )
+        try:
+            s3_parts = self.s3_service.list_all_uploaded_parts(
+                object_key=session.object_key,
+                s3_upload_id=session.s3_upload_id,
+            )
+        except ClientError as exc:
+            error_code = exc.response.get("Error", {}).get("Code", "")
+            if error_code not in ("NoSuchUpload", "NoSuchBucket"):
+                raise
+
+            logger.warning(
+                "Multipart upload %s for session %s is unavailable in S3 (%s); creating a new upload.",
+                session.s3_upload_id,
+                session.upload_id,
+                error_code,
+            )
+            if error_code == "NoSuchBucket":
+                self.s3_service.ensure_bucket_and_cors()
+            session.s3_upload_id = self.s3_service.create_multipart_upload(session.object_key)
+            session.status = UploadStatus.INITIATED
+            session.updated_at = datetime.now(timezone.utc)
+            db.commit()
+            s3_parts = []
 
         uploaded_part_numbers = {p["PartNumber"] for p in s3_parts}
         all_part_numbers = set(range(1, session.total_parts + 1))
@@ -487,4 +517,3 @@ class UploadService:
             cleaned_sessions_count=cleaned_count,
             message=f"Successfully cleaned up and aborted {cleaned_count} expired upload session(s).",
         )
-
